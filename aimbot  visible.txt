@@ -1,0 +1,159 @@
+using AotForms;
+using System;
+using System.Collections.Generic;
+using System.Numerics;
+using System.Threading;
+using System.Runtime.InteropServices;
+using System.Windows.Forms;
+
+internal static class AimbotVisible
+{
+    private static Thread aimThread;
+    private static bool isRunning = false;
+    private static Dictionary<nuint, uint> patchedMemory = new();
+    private static DateTime lastClickStart = DateTime.MinValue;
+    private static bool isClickHeld = false;
+    private static DateTime lastSilentRestore = DateTime.Now;
+
+    public static bool IsAlive()
+    {
+        return isRunning && aimThread != null && aimThread.IsAlive;
+    }
+
+    internal static void Start()
+    {
+        if (isRunning) return;
+
+        isRunning = true;
+        aimThread = new Thread(() =>
+        {
+            while (isRunning)
+            {
+                try
+                {
+                   
+                    if ((DateTime.Now - lastSilentRestore).TotalMilliseconds >= 3001)
+                    {
+                        RestorePatchedMemory(); 
+                        lastSilentRestore = DateTime.Now;
+                    }
+
+                    if (!Config.AimBot || Core.Width < 1 || Core.Height < 1 || !Core.HaveMatrix)
+                    {
+                        RestorePatchedMemory();
+                        Thread.Sleep(11);
+                        continue;
+                    }
+
+                    Entity target = FindBestTarget();
+                    if (target == null || target.Address == 0)
+                    {
+                        Thread.Sleep(5);
+                        continue;
+                    }
+
+                    if (!InternalMemory.Read<uint>(target.Address + 0x3f0, out var headCollider) || headCollider == 0)
+                        continue;
+
+                    bool isMouseDown = (GetAsyncKeyState((int)Keys.LButton) & 0x8000) != 0;
+
+                    if (isMouseDown)
+                    {
+                        if (!isClickHeld)
+                        {
+                            lastClickStart = DateTime.Now;
+                            isClickHeld = true;
+                        }
+
+                        TimeSpan heldDuration = DateTime.Now - lastClickStart;
+                        if (heldDuration.TotalSeconds >= 5)
+                        {
+                            RestorePatchedMemory();
+                            Thread.Sleep(1);
+                            continue;
+                        }
+
+                        nuint patchAddr = target.Address + 0x50;
+
+                        if (!patchedMemory.ContainsKey(patchAddr))
+                        {
+                            if (InternalMemory.Read<uint>(patchAddr, out var original))
+                            {
+                                patchedMemory[patchAddr] = original;
+                            }
+                        }
+
+                        InternalMemory.Write(patchAddr, headCollider);
+                    }
+                    else
+                    {
+                        isClickHeld = false;
+                        lastClickStart = DateTime.MinValue;
+                        RestorePatchedMemory();
+                    }
+
+                    Thread.Sleep(1);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine("[AimbotVisible] Error: " + ex.Message);
+                    Thread.Sleep(100);
+                }
+            }
+
+            RestorePatchedMemory();
+        });
+
+        aimThread.IsBackground = true;
+        aimThread.Start();
+    }
+
+    internal static void Stop()
+    {
+        isRunning = false;
+        try
+        {
+            aimThread?.Join(300);
+        }
+        catch { }
+    }
+
+    private static void RestorePatchedMemory()
+    {
+        foreach (var kv in patchedMemory)
+        {
+            InternalMemory.Write(kv.Key, kv.Value);
+        }
+        patchedMemory.Clear();
+    }
+
+    private static Entity FindBestTarget()
+    {
+        Entity bestTarget = null;
+        float closestDistance = float.MaxValue;
+        var screenCenter = new Vector2(Core.Width / 2f, Core.Height / 2f);
+
+        foreach (var entity in Core.Entities.Values)
+        {
+            if (entity == null || entity.IsDead || (Config.IgnoreKnocked && entity.IsKnocked)) continue;
+
+            var head2D = W2S.WorldToScreen(Core.CameraMatrix, entity.Head, Core.Width, Core.Height);
+            if (head2D.X < 1 || head2D.Y < 1) continue;
+
+            float dist3D = Vector3.Distance(Core.LocalMainCamera, entity.Head);
+            if (dist3D > Config.AimBotMaxDistance) continue;
+
+            float dist2D = Vector2.Distance(screenCenter, head2D);
+            if (dist2D < closestDistance && dist2D <= Config.Aimfov)
+            {
+                closestDistance = dist2D;
+                bestTarget = entity;
+            }
+        }
+
+        return bestTarget;
+    }
+
+    [DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
+}
